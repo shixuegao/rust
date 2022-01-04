@@ -7,9 +7,12 @@ use std::panic;
 use std::time::{Duration, SystemTime};
 
 const MAX_WORKER_COUNT: u32 = 1 << 31 - 1; //2^31 - 1
-const POOL_STATE_RUNNING: u32 = 0;
-const POOL_STATE_SHUTDOWN: u32 = 1;
-const POOL_STATE_STOP: u32 = 2;
+
+enum State {
+  Running = 0,
+  Shutdown = 1,
+  Stop = 2
+}
 
 enum PoolError {
   ChannelShutdown,
@@ -284,9 +287,9 @@ where T: Worker + Send + 'static + panic::UnwindSafe
           inner.update_active_time();
         } else {
           let cur_state = current_state(inner.pool_state.as_ref());
-          if cur_state == POOL_STATE_STOP {
+          if cur_state == State::Stop as u32 {
             break;
-          } else if cur_state == POOL_STATE_SHUTDOWN {
+          } else if cur_state == State::Shutdown as u32 {
             if inner.has_workers_in_queue() {
               continue;
             }
@@ -384,7 +387,7 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
       keep_alive_time,
       thread_id: Arc::new(AtomicU64::new(0)),
       workers: new_async_lock(vec![]),
-      state: Arc::new(AtomicU32::new(POOL_STATE_RUNNING)),
+      state: Arc::new(AtomicU32::new(State::Running as u32)),
       handlers: new_async_lock(vec![]),
       request_sender: tx,
       request_receiver: new_async_lock(rx)
@@ -456,7 +459,7 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
   }
 
   fn is_running(&self) -> bool {
-    return current_state(&self.state.as_ref()) == POOL_STATE_RUNNING;
+    return current_state(&self.state.as_ref()) == State::Running as u32;
   }
 
   fn compare_exchange(&self, current: u32, new: u32) -> bool {
@@ -557,7 +560,8 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
   }
 
   pub fn process_echo(&mut self, t: T) -> (impl FnOnce(Duration) -> ProcessResult<T>, impl FnOnce() -> bool) {
-    let ipr = self.inner_process(t, WrapperType::Echo);
+    let mut ipr = self.inner_process(t, WrapperType::Echo);
+    let opt_interrupt = ipr.opt_interrupt.take();
     let f_pr = move |timeout| {
       if ipr.r.is_err() {
         return ProcessResult::new(ipr.r, ipr.opt_t, None);
@@ -579,12 +583,13 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
       }
       return ProcessResult::new(ipr.r, None, None);
     };
-    let f_i = InnerInterrupt::sign_fn(ipr.opt_interrupt);
+    let f_i = InnerInterrupt::sign_fn(opt_interrupt);
     (f_pr, f_i)
   }
 
   pub fn process_output(&mut self, t: T) -> (impl FnOnce(Duration) -> ProcessResult<T>, impl FnOnce() -> bool) {
-    let ipr = self.inner_process(t, WrapperType::EchoAndOutput);
+    let mut ipr = self.inner_process(t, WrapperType::EchoAndOutput);
+    let opt_interrupt = ipr.opt_interrupt.take();
     let f_pr = move |timeout| {
       if ipr.r.is_err() {
         return ProcessResult::new(ipr.r, ipr.opt_t, None);
@@ -611,7 +616,7 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
         }
       }
     };
-    let f_i = InnerInterrupt::sign_fn(ipr.opt_interrupt);
+    let f_i = InnerInterrupt::sign_fn(opt_interrupt);
     (f_pr, f_i)
   }
 
@@ -628,7 +633,7 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
   } 
 
   pub fn shutdown(&mut self) {
-    if !self.compare_exchange(POOL_STATE_RUNNING, POOL_STATE_SHUTDOWN) {
+    if !self.compare_exchange(State::Running as u32, State::Shutdown as u32) {
       return
     }
     self.close_req_sender();
@@ -636,7 +641,7 @@ where T: Worker + Send + 'static + panic::UnwindSafe,
   }
 
   pub fn shutdown_now(&mut self) -> Option<Vec<T>> {
-    if !self.compare_exchange(POOL_STATE_RUNNING, POOL_STATE_STOP) {
+    if !self.compare_exchange(State::Running as u32, State::Stop as u32) {
       return None
     }
     self.close_req_sender();
